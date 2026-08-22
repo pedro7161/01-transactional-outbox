@@ -1,0 +1,26 @@
+{
+  "name": "order-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "orderdb",
+    "topic.prefix": "orderdb",
+    "plugin.name": "pgoutput",
+    "slot.name": "order_outbox_slot",
+    "publication.autocreate.mode": "filtered",
+    "table.include.list": "public.outbox_event",
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.expand.json.payload": "true",
+    "transforms.outbox.table.field.event.timestamp": "timestamp",
+    "transforms.outbox.route.topic.replacement": "order-events"
+  }
+}
