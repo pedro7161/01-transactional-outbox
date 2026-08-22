@@ -269,7 +269,8 @@ class TransactionalOutboxE2EIT {
                 "/kafka/bin/kafka-console-consumer.sh " +
                         "--bootstrap-server kafka:9092 " +
                         "--topic order-events " +
-                        "--from-beginning " +
+                        "--partition 0 " +
+                        "--offset earliest " +
                         "--max-messages 1 " +
                         "--timeout-ms 3000");
         return result.getStdout() + result.getStderr();
