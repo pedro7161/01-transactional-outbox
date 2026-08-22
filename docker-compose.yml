@@ -1,0 +1,131 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orderdb
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orderdb"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: quay.io/debezium/kafka:3.6.1.Final
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      NODE_ID: 1
+      NODE_ROLE: combined
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      - kafka-data:/kafka/data
+
+  connect:
+    image: quay.io/debezium/connect:3.6.1.Final
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: outbox-connect-cluster
+      CONFIG_STORAGE_TOPIC: outbox_connect_configs
+      OFFSET_STORAGE_TOPIC: outbox_connect_offsets
+      STATUS_STORAGE_TOPIC: outbox_connect_statuses
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka
+      - postgres
+
+  order-service:
+    build:
+      context: ./order-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/orderdb
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: ./inventory-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/inventorydb
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  debezium-init:
+    image: curlimages/curl:8.12.1
+    volumes:
+      - ./infrastructure/debezium/register-order-outbox.json:/config/register-order-outbox.json:ro
+    depends_on:
+      - connect
+      - order-service
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka Connect..."
+        until curl -fsS http://connect:8083/connectors >/dev/null; do sleep 2; done
+        echo "Waiting for order-service and Flyway..."
+        until curl -fsS http://order-service:8080/q/health/ready >/dev/null; do sleep 2; done
+        if curl -fsS http://connect:8083/connectors/order-outbox-connector >/dev/null; then
+          echo "Debezium connector already registered"
+        else
+          echo "Registering Debezium outbox connector"
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            --data @/config/register-order-outbox.json \
+            http://connect:8083/connectors
+          echo
+        fi
+
+  cdc-observer:
+    image: quay.io/debezium/kafka:3.6.1.Final
+    depends_on:
+      debezium-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Watching order-events. Each line below proves Debezium captured an outbox row and published it to Kafka."
+        /kafka/bin/kafka-console-consumer.sh \
+          --bootstrap-server kafka:9092 \
+          --topic order-events \
+          --group cdc-observer \
+          --property print.key=true \
+          --property key.separator=' | ' \
+          --from-beginning | while IFS= read -r line; do
+            echo "Debezium captured event -> Kafka: $line"
+          done
+
+volumes:
+  postgres-data:
+  kafka-data:
