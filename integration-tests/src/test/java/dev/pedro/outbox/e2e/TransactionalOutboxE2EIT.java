@@ -1,5 +1,6 @@
 package dev.pedro.outbox.e2e;
 
+import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -107,19 +108,27 @@ class TransactionalOutboxE2EIT {
             eventId.set(foundEventId);
         });
 
-        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
-            String connectorStatus = connectorStatus();
-            String topics = listKafkaTopics();
-            String diagnostic = "Connector status: " + connectorStatus + "\nKafka topics:\n" + topics;
+        try {
+            await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
+                String connectorStatus = connectorStatus();
+                String topics = listKafkaTopics();
+                String diagnostic = "Connector status: " + connectorStatus + "\nKafka topics:\n" + topics;
 
-            assertTrue(!connectorStatus.contains("\"state\":\"FAILED\""), diagnostic);
-            assertTrue(topics.lines().anyMatch("order-events"::equals), diagnostic);
+                assertTrue(!connectorStatus.contains("\"state\":\"FAILED\""), diagnostic);
+                assertTrue(topics.lines().anyMatch("order-events"::equals), diagnostic);
 
-            String kafkaMessage = readFirstKafkaMessage();
-            assertTrue(kafkaMessage.contains(orderId.toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
-            assertTrue(kafkaMessage.contains(eventId.get().toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
-            assertTrue(kafkaMessage.contains("OrderCreated"), diagnostic + "\nKafka output:\n" + kafkaMessage);
-        });
+                String kafkaMessage = readFirstKafkaMessage();
+                assertTrue(kafkaMessage.contains(orderId.toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
+                assertTrue(kafkaMessage.contains(eventId.get().toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
+                assertTrue(kafkaMessage.contains("OrderCreated"), diagnostic + "\nKafka output:\n" + kafkaMessage);
+            });
+        } catch (ConditionTimeoutException failure) {
+            System.err.println("=== Kafka Connect logs ===");
+            System.err.println(connectContainer().getLogs());
+            System.err.println("=== PostgreSQL CDC state ===");
+            System.err.println(readPostgresCdcState());
+            throw failure;
+        }
 
         await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
                 assertEquals(1L, countInventoryRows(orderId, eventId.get())));
@@ -266,12 +275,54 @@ class TransactionalOutboxE2EIT {
         return result.getStdout() + result.getStderr();
     }
 
-    private static ContainerState kafkaContainer() {
-        Optional<ContainerState> kafka = environment.getContainerByServiceName("kafka-1");
-        if (kafka.isEmpty()) {
-            kafka = environment.getContainerByServiceName("kafka");
+    private static String readPostgresCdcState() throws SQLException {
+        StringBuilder diagnostic = new StringBuilder();
+        try (Connection connection = orderDatabaseConnection()) {
+            try (ResultSet publications = connection.createStatement().executeQuery(
+                    "SELECT pubname, schemaname, tablename FROM pg_publication_tables ORDER BY pubname, schemaname, tablename")) {
+                diagnostic.append("publications:\n");
+                while (publications.next()) {
+                    diagnostic.append(publications.getString("pubname"))
+                            .append(" | ")
+                            .append(publications.getString("schemaname"))
+                            .append(".")
+                            .append(publications.getString("tablename"))
+                            .append("\n");
+                }
+            }
+
+            try (ResultSet slots = connection.createStatement().executeQuery(
+                    "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots ORDER BY slot_name")) {
+                diagnostic.append("replication slots:\n");
+                while (slots.next()) {
+                    diagnostic.append(slots.getString("slot_name"))
+                            .append(" | active=")
+                            .append(slots.getBoolean("active"))
+                            .append(" | restart_lsn=")
+                            .append(slots.getString("restart_lsn"))
+                            .append(" | confirmed_flush_lsn=")
+                            .append(slots.getString("confirmed_flush_lsn"))
+                            .append("\n");
+                }
+            }
         }
-        return kafka.orElseThrow(() -> new IllegalStateException("Kafka container not found"));
+        return diagnostic.toString();
+    }
+
+    private static ContainerState kafkaContainer() {
+        return containerByServiceName("kafka");
+    }
+
+    private static ContainerState connectContainer() {
+        return containerByServiceName("connect");
+    }
+
+    private static ContainerState containerByServiceName(String serviceName) {
+        Optional<ContainerState> container = environment.getContainerByServiceName(serviceName + "-1");
+        if (container.isEmpty()) {
+            container = environment.getContainerByServiceName(serviceName);
+        }
+        return container.orElseThrow(() -> new IllegalStateException(serviceName + " container not found"));
     }
 
     private static Connection orderDatabaseConnection() throws SQLException {
