@@ -38,6 +38,7 @@ class TransactionalOutboxE2EIT {
     private static final String CONNECT_SERVICE = "connect-1";
     private static final String ORDER_SERVICE = "order-service-1";
     private static final String INVENTORY_SERVICE = "inventory-service-1";
+    private static final String CONNECTOR_STATUS_PATH = "/connectors/order-outbox-connector/status";
     private static final Pattern ORDER_ID_PATTERN = Pattern.compile("\\\"id\\\"\\s*:\\s*\\\"([0-9a-fA-F-]{36})\\\"");
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
@@ -107,10 +108,17 @@ class TransactionalOutboxE2EIT {
         });
 
         await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
+            String connectorStatus = connectorStatus();
+            String topics = listKafkaTopics();
+            String diagnostic = "Connector status: " + connectorStatus + "\nKafka topics:\n" + topics;
+
+            assertTrue(!connectorStatus.contains("\"state\":\"FAILED\""), diagnostic);
+            assertTrue(topics.lines().anyMatch("order-events"::equals), diagnostic);
+
             String kafkaMessage = readFirstKafkaMessage();
-            assertTrue(kafkaMessage.contains(orderId.toString()), kafkaMessage);
-            assertTrue(kafkaMessage.contains(eventId.get().toString()), kafkaMessage);
-            assertTrue(kafkaMessage.contains("OrderCreated"), kafkaMessage);
+            assertTrue(kafkaMessage.contains(orderId.toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
+            assertTrue(kafkaMessage.contains(eventId.get().toString()), diagnostic + "\nKafka output:\n" + kafkaMessage);
+            assertTrue(kafkaMessage.contains("OrderCreated"), diagnostic + "\nKafka output:\n" + kafkaMessage);
         });
 
         await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
@@ -164,14 +172,29 @@ class TransactionalOutboxE2EIT {
         assertEquals(201, response.statusCode(), response.body());
 
         await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
-            HttpRequest statusRequest = HttpRequest.newBuilder(
-                            connectUri("/connectors/order-outbox-connector/status"))
-                    .GET()
-                    .build();
-            HttpResponse<String> status = HTTP.send(statusRequest, HttpResponse.BodyHandlers.ofString());
-            assertEquals(200, status.statusCode(), status.body());
-            assertTrue(status.body().contains("\"state\":\"RUNNING\""), status.body());
+            String status = connectorStatus();
+            assertTrue(!status.contains("\"state\":\"FAILED\""), status);
+            assertTrue(countOccurrences(status, "\"state\":\"RUNNING\"") >= 2, status);
         });
+    }
+
+    private static String connectorStatus() throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(connectUri(CONNECTOR_STATUS_PATH))
+                .GET()
+                .build();
+        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode(), response.body());
+        return response.body();
+    }
+
+    private static int countOccurrences(String value, String needle) {
+        int count = 0;
+        int index = 0;
+        while ((index = value.indexOf(needle, index)) >= 0) {
+            count++;
+            index += needle.length();
+        }
+        return count;
     }
 
     private static long countOrderRows(UUID orderId) throws SQLException {
@@ -222,9 +245,16 @@ class TransactionalOutboxE2EIT {
         }
     }
 
+    private static String listKafkaTopics() throws Exception {
+        Container.ExecResult result = kafkaContainer().execInContainer(
+                "bash",
+                "-lc",
+                "/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list");
+        return result.getStdout() + result.getStderr();
+    }
+
     private static String readFirstKafkaMessage() throws Exception {
-        ContainerState kafka = kafkaContainer();
-        Container.ExecResult result = kafka.execInContainer(
+        Container.ExecResult result = kafkaContainer().execInContainer(
                 "bash",
                 "-lc",
                 "/kafka/bin/kafka-console-consumer.sh " +
