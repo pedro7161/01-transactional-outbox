@@ -1,10 +1,14 @@
 name: CI
 
+# The end-to-end suite provisions Docker infrastructure; opt in when dispatching.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      run_integration:
+        description: Run the transactional-outbox end-to-end suite after unit tests pass
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -28,6 +32,8 @@ jobs:
         run: mvn -B --no-transfer-progress verify
 
   end-to-end-integration:
+    if: inputs.run_integration
+    needs: build-and-test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
